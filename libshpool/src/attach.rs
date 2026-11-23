@@ -14,7 +14,8 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    env, fmt, io,
+    env, fmt,
+    io::{self, Write as _},
     os::fd::AsFd,
     path::PathBuf,
     sync::{Arc, Mutex},
@@ -38,6 +39,28 @@ use crate::{
 };
 
 const MAX_FORCE_RETRIES: usize = 20;
+
+/// What this client writes to its terminal once it stops being attached, to
+/// turn off what the session's programs may have left on there. They will
+/// never get to turn it off in this terminal themselves.
+const TERMINAL_RESET: &[u8] = concat!(
+    // Empty both screens' kitty keyboard flag stacks (each screen has its
+    // own), popping more entries than apps push in practice, and end up on
+    // the main screen. Going to the alternate screen first makes `?1049l`
+    // always leave it, which puts the cursor back where it was on the main
+    // screen when an app switched with `?1049h`. Sent on the main screen,
+    // Ghostty and xterm would move the cursor to a stale saved position, and
+    // after `?47h` or `?1047h`, which save no cursor, they still can.
+    "\x1b[?1049h\x1b[<99u\x1b[?1049l\x1b[<99u",
+    // Mouse reporting and its encodings.
+    "\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1016l",
+    // Focus reports, bracketed paste, application cursor keys and keypad,
+    // modifyOtherKeys, newline mode (Enter sending CR LF).
+    "\x1b[?1004l\x1b[?2004l\x1b[?1l\x1b>\x1b[>4m\x1b[20l",
+    // Screen-wide reverse video off, show the cursor and put its style back.
+    "\x1b[?5l\x1b[?25h\x1b[0 q",
+)
+.as_bytes();
 
 #[allow(clippy::too_many_arguments)]
 pub fn run(
@@ -229,10 +252,17 @@ impl Attach {
 
         info!("entering bidi streaming mode");
         let session_name_tmpl = self.tmpls.session_name.clone();
-        match attach_client.pipe_bytes(move |maybe_switch: &MaybeSwitch| {
+        let result = attach_client.pipe_bytes(move |maybe_switch: &MaybeSwitch| {
             let var_map: HashMap<String, String> = maybe_switch.vars.iter().cloned().collect();
             session_name_tmpl.apply(&var_map) != resolved.session_name
-        }) {
+        });
+        // Detached, taken over by another client, switched or the shell
+        // exited: either way this terminal is no longer the session's.
+        let mut stdout = io::stdout();
+        if let Err(e) = stdout.write_all(TERMINAL_RESET).and_then(|_| stdout.flush()) {
+            debug!("failed to reset the terminal: {e}");
+        }
+        match result {
             Ok(PipeBytesResult::Exit(exit_status)) => std::process::exit(exit_status),
             Ok(PipeBytesResult::MaybeSwitch(s)) => Ok(AttachResult::Switch(s)),
             Err(e) => Err(e),

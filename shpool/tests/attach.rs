@@ -6,7 +6,7 @@ use std::{
     io::BufRead,
     io::{Read, Write},
     path::PathBuf,
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
     thread, time,
 };
 
@@ -20,6 +20,35 @@ use crate::support::{
     daemon::{AttachArgs, DaemonArgs},
     tmpdir,
 };
+
+/// `TERMINAL_RESET` from libshpool/src/attach.rs, which the attach client
+/// writes when it lets go of the terminal.
+const TERMINAL_RESET: &str = concat!(
+    "\x1b[?1049h\x1b[<99u\x1b[?1049l\x1b[<99u",
+    "\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1016l",
+    "\x1b[?1004l\x1b[?2004l\x1b[?1l\x1b>\x1b[>4m\x1b[20l",
+    "\x1b[?5l\x1b[?25h\x1b[0 q",
+);
+
+/// Matches a line that ends with `TERMINAL_RESET`. An exiting client writes
+/// nothing after the reset, not even a newline, so the line matcher only
+/// sees it once the client has exited: wait() for the client first.
+fn terminal_reset_re() -> String {
+    format!("{}$", regex::escape(TERMINAL_RESET))
+}
+
+/// Waits for a client that never attached and checks that it left the
+/// terminal alone.
+fn assert_no_terminal_reset(proc: &mut Child) -> anyhow::Result<()> {
+    proc.wait()?;
+    let mut out = Vec::new();
+    proc.stdout.take().context("missing stdout")?.read_to_end(&mut out)?;
+    assert!(
+        !String::from_utf8_lossy(&out).contains(TERMINAL_RESET),
+        "a client that never attached reset the terminal"
+    );
+    Ok(())
+}
 
 #[test]
 #[timeout(30000)]
@@ -870,9 +899,12 @@ fn explicit_exit() -> anyhow::Result<()> {
         line_matcher.scan_until_re("first$")?;
 
         attach_proc.run_cmd("exit")?;
+        // wait() will close this, so we'll snatch it to prevent that.
+        let _stdin = attach_proc.proc.stdin.take();
+        attach_proc.proc.wait()?;
+        line_matcher.scan_until_re(&terminal_reset_re())?;
 
-        // wait until the daemon has cleaned up before dropping
-        // and explicitly killing the attach proc.
+        // wait until the daemon has cleaned up before reattaching.
         daemon_proc.events = Some(bidi_done_w.wait_final_event("daemon-bidi-stream-done")?);
     }
 
@@ -993,6 +1025,12 @@ fn force_attach() -> anyhow::Result<()> {
     tty2.run_cmd("echo $MYVAR")?;
     line_matcher2.match_re("set_from_tty1$")?;
 
+    // tty1 was taken over, so it resets its terminal and exits. wait() will
+    // close its stdin, so we'll snatch it to prevent that.
+    let _tty1_stdin = tty1.proc.stdin.take();
+    tty1.proc.wait()?;
+    line_matcher1.scan_until_re(&terminal_reset_re())?;
+
     Ok(())
 }
 
@@ -1013,6 +1051,7 @@ fn busy() -> anyhow::Result<()> {
     let mut tty2 = daemon_proc.attach("sh1", Default::default()).context("attaching from tty2")?;
     let mut line_matcher2 = tty2.stderr_line_matcher()?;
     line_matcher2.scan_until_re("already has a terminal attached$")?;
+    assert_no_terminal_reset(&mut tty2.proc)?;
 
     Ok(())
 }
@@ -1037,6 +1076,7 @@ fn busy_background() -> anyhow::Result<()> {
     let mut line_matcher2 = tty2.stderr_line_matcher()?;
     line_matcher2.scan_until_re("already has a terminal attached$")?;
     assert!(tty2.proc.wait()?.success(), "busy background attach should exit successfully");
+    assert_no_terminal_reset(&mut tty2.proc)?;
 
     Ok(())
 }
@@ -1161,8 +1201,11 @@ fn daemon_hangup() -> anyhow::Result<()> {
 
     daemon_proc.proc_kill()?;
 
+    // wait() will close this, so we'll snatch it to prevent that.
+    let _stdin = attach_proc.proc.stdin.take();
     let exit_status = attach_proc.proc.wait()?;
     assert!(!exit_status.success());
+    line_matcher.scan_until_re(&terminal_reset_re())?;
 
     Ok(())
 }
@@ -1188,6 +1231,7 @@ fn default_keybinding_detach() -> anyhow::Result<()> {
     let exit_status = a1.proc.wait()?;
     dbg!(exit_status);
     assert!(exit_status.success());
+    lm1.scan_until_re(&terminal_reset_re())?;
 
     waiter.wait_event("daemon-bidi-stream-done")?;
 
@@ -1331,6 +1375,7 @@ fn custom_keybinding_detach() -> anyhow::Result<()> {
 
     a1.run_raw_cmd(vec![22, 23, 7])?; // Ctrl-v Ctrl-w Ctrl-g
     a1.proc.wait()?;
+    lm1.scan_until_re(&terminal_reset_re())?;
 
     waiter.wait_event("daemon-bidi-stream-done")?;
 
@@ -2382,7 +2427,8 @@ fn templated_session_name_switch() -> anyhow::Result<()> {
 
     // Also verify we can still run commands in the new session
     attach_proc.run_cmd("echo $SHPOOL_SESSION_NAME")?;
-    line_matcher.scan_until_re("dev-session$")?;
+    // the client reset the terminal before attaching to the new session
+    line_matcher.scan_until_re(&format!("{}.*dev-session$", regex::escape(TERMINAL_RESET)))?;
 
     Ok(())
 }
